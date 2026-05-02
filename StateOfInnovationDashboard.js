@@ -180,6 +180,11 @@ function onOpen() {
         .addItem("Explain this row", "explainRowWithAi")
         .addItem("What should I work on next?", "whatToWorkOnAi")
         .addItem("Draft this week's standup", "draftStandupAi")
+        .addSeparator()
+        .addItem("Suggest tier / priority / status from Notes", "suggestTierPriorityStatusAi")
+        .addItem("Flag risks & stale work", "flagRisksAi")
+        .addItem("Draft missing hypotheses", "draftHypothesesAi")
+        .addItem("Propose new Pebble experiments", "proposeNewPebblesAi")
     )
     .addSubMenu(
       SpreadsheetApp.getUi().createMenu("Maintenance")
@@ -1086,12 +1091,17 @@ function callGemini_(prompt, options) {
 
   var url = "https://generativelanguage.googleapis.com/v1beta/models/" + GEMINI_MODEL +
             ":generateContent?key=" + encodeURIComponent(GEMINI_API_KEY);
+  var generationConfig = {
+    temperature: options.temperature != null ? options.temperature : 0.4,
+    maxOutputTokens: options.maxOutputTokens || 1024
+  };
+  if (options.responseMimeType) {
+    generationConfig.responseMimeType = options.responseMimeType;
+  }
+
   var body = {
     contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: {
-      temperature: options.temperature != null ? options.temperature : 0.4,
-      maxOutputTokens: options.maxOutputTokens || 1024
-    }
+    generationConfig: generationConfig
   };
 
   var response;
@@ -1337,6 +1347,301 @@ function aiResultModalHtml_(title, markdown, totalTokens) {
     '  });' +
     '  document.getElementById("close").addEventListener("click", function(){ google.script.host.close(); });' +
     '</script></body></html>';
+}
+
+// ============================================================
+// AI DIFF INFRASTRUCTURE — proposes changes, you accept/reject, applies
+// ============================================================
+
+function callGeminiJson_(prompt, options) {
+  options = options || {};
+  options.responseMimeType = "application/json";
+  return callGemini_(prompt, options);
+}
+
+// Patched callGemini_ to honor responseMimeType when present (for JSON outputs).
+// We do this by wrapping — see the actual change inside callGemini_'s body
+// in the existing AI section above. (No-op shim if already supported.)
+
+function findRowByInnovation_(sheet, innovationName) {
+  var lastRow = sheet.getLastRow();
+  if (lastRow < CONFIG.dataStartRow) return -1;
+  var values = sheet.getRange(CONFIG.dataStartRow, COL.innovation + 1, lastRow - CONFIG.dataStartRow + 1, 1).getValues();
+  var target = clean_(innovationName);
+  for (var i = 0; i < values.length; i++) {
+    var name = clean_(values[i][0]).replace(/^(\[\d+d\]\s+)+/, "");
+    if (name === target) return CONFIG.dataStartRow + i;
+  }
+  return -1;
+}
+
+var DIFF_SHEET_COLUMNS = {
+  status: COL.status,
+  tier: COL.tier,
+  priority: COL.priority,
+  confidence: COL.confidence,
+  notes: COL.notes
+};
+
+var DIFF_NARRATIVE_COLUMNS = ["hypothesis", "killCriteria", "evidenceLink"];
+
+function applyDiffProposals(proposals) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Innovations") || SpreadsheetApp.getActiveSheet();
+  // Try the active sheet too in case the user is on it
+  var activeSheet = SpreadsheetApp.getActiveSheet();
+  if (activeSheet.getRange(1, COL.innovation + 1).getValue() === HEADERS[COL.innovation]) {
+    sheet = activeSheet;
+  }
+
+  var applied = 0;
+  var skipped = [];
+  var today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd");
+
+  proposals.forEach(function(p) {
+    try {
+      if (p.kind === "update") {
+        var rowIdx = findRowByInnovation_(sheet, p.row);
+        if (rowIdx < 0) { skipped.push(p.row + ": row not found"); return; }
+
+        if (DIFF_SHEET_COLUMNS.hasOwnProperty(p.column)) {
+          sheet.getRange(rowIdx, DIFF_SHEET_COLUMNS[p.column] + 1).setValue(p.to);
+          appendDecisionLogEntry_(p.row, {
+            when: today,
+            transition: p.column + ": " + (p.from || "(empty)") + " → " + p.to,
+            what: p.reason || "",
+            who: "AI triage"
+          });
+          applied += 1;
+        } else if (DIFF_NARRATIVE_COLUMNS.indexOf(p.column) !== -1) {
+          var fields = {};
+          fields[p.column] = p.to;
+          setBetDetail_(p.row, fields);
+          appendDecisionLogEntry_(p.row, {
+            when: today,
+            transition: p.column + " set",
+            what: p.reason || "",
+            who: "AI triage"
+          });
+          applied += 1;
+        } else {
+          skipped.push(p.row + ": unknown column '" + p.column + "'");
+        }
+      } else if (p.kind === "create") {
+        var lastRow = sheet.getLastRow();
+        var newRow = [];
+        for (var c = 0; c < CONFIG.numCols; c++) newRow.push("");
+        var d = p.data || {};
+        newRow[COL.innovation] = clean_(d.innovation || p.row);
+        newRow[COL.investigator] = clean_(d.investigator);
+        newRow[COL.tier] = clean_(d.tier);
+        newRow[COL.priority] = clean_(d.priority);
+        newRow[COL.status] = clean_(d.status) || STATUS.IDEA;
+        newRow[COL.notes] = clean_(d.notes);
+        newRow[COL.updated] = new Date();
+        sheet.appendRow(newRow);
+        applied += 1;
+      } else {
+        skipped.push((p.row || "?") + ": unknown kind '" + p.kind + "'");
+      }
+    } catch (e) {
+      skipped.push((p.row || "?") + ": " + e.message);
+    }
+  });
+
+  return { applied: applied, skipped: skipped };
+}
+
+function runDiffMode_(modeId, modeLabel, prompt) {
+  var ui = SpreadsheetApp.getUi();
+  var raw;
+  try {
+    raw = callGemini_(prompt, { mode: modeId, maxOutputTokens: 2400, responseMimeType: "application/json" });
+  } catch (e) {
+    ui.alert("AI call failed: " + e.message);
+    return;
+  }
+
+  var parsed;
+  try {
+    parsed = JSON.parse(raw.text);
+  } catch (e) {
+    ui.alert("Gemini returned non-JSON output. Raw response:\n\n" + raw.text.substring(0, 500));
+    return;
+  }
+
+  var proposals = (parsed && parsed.proposals) || [];
+  if (proposals.length === 0) {
+    ui.alert("No proposals returned. Either Gemini found nothing actionable, or the prompt needs tuning.");
+    return;
+  }
+
+  var html = HtmlService.createHtmlOutput(diffReviewModalHtml_(modeLabel, proposals, raw.totalTokens))
+    .setWidth(720).setHeight(640);
+  ui.showModalDialog(html, "AI Triage · " + modeLabel);
+}
+
+function diffReviewModalHtml_(modeLabel, proposals, totalTokens) {
+  var safeLabel = modeLabel.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  var safeProposals = JSON.stringify(proposals);
+  return '' +
+    '<!DOCTYPE html><html><head><base target="_top">' +
+    '<style>' +
+    '  body{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#0a0a0a;background:#fafafa;margin:0;padding:18px;}' +
+    '  .eyebrow{font-size:9px;font-weight:700;letter-spacing:0.18em;text-transform:uppercase;color:#999;margin-bottom:4px;}' +
+    '  h1{font-size:18px;margin:0 0 4px;line-height:1.3;}' +
+    '  .meta{font-size:11px;color:#666;margin-bottom:14px;}' +
+    '  .list{max-height:430px;overflow-y:auto;border:1px solid rgba(0,0,0,0.1);background:#fff;}' +
+    '  .card{padding:12px 14px;border-bottom:1px solid rgba(0,0,0,0.08);display:flex;gap:12px;align-items:flex-start;}' +
+    '  .card:last-child{border-bottom:0;}' +
+    '  .card input[type=checkbox]{margin-top:3px;width:16px;height:16px;}' +
+    '  .card-body{flex:1;}' +
+    '  .row-name{font-size:12px;font-weight:600;color:#0a0a0a;margin-bottom:4px;}' +
+    '  .diff{font-size:11px;color:#444;margin-bottom:6px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#fafafa;padding:4px 8px;border-left:3px solid #F7BE68;}' +
+    '  .reason{font-size:11px;color:#555;line-height:1.5;}' +
+    '  .actions{display:flex;gap:8px;margin-top:14px;align-items:center;}' +
+    '  button{font-family:inherit;font-size:11px;font-weight:700;letter-spacing:0.16em;text-transform:uppercase;padding:9px 18px;cursor:pointer;border:1px solid #0a0a0a;background:#fff;color:#0a0a0a;}' +
+    '  button.primary{background:#0a0a0a;color:#F7BE68;}' +
+    '  button[disabled]{opacity:0.5;cursor:default;}' +
+    '  .status{font-size:10px;color:#999;margin-left:auto;}' +
+    '  .selectall{font-size:11px;color:#444;margin:0 0 8px;cursor:pointer;}' +
+    '  .selectall input{margin-right:6px;vertical-align:middle;}' +
+    '</style></head><body>' +
+    '<div class="eyebrow">AI Triage · Gemini</div>' +
+    '<h1>' + safeLabel + '</h1>' +
+    '<div class="meta"><span id="count"></span> proposal(s) · ' + totalTokens + ' tokens used</div>' +
+    '<label class="selectall"><input type="checkbox" id="all" checked>Select / deselect all</label>' +
+    '<div class="list" id="list"></div>' +
+    '<div class="actions"><button id="apply" class="primary">Apply selected</button><button id="cancel">Cancel</button><span class="status" id="status"></span></div>' +
+    '<script>' +
+    '  var PROPS = ' + safeProposals + ';' +
+    '  document.getElementById("count").textContent = PROPS.length;' +
+    '  var list = document.getElementById("list");' +
+    '  PROPS.forEach(function(p, i){' +
+    '    var card = document.createElement("div"); card.className = "card";' +
+    '    var cb = document.createElement("input"); cb.type = "checkbox"; cb.checked = true; cb.dataset.idx = i;' +
+    '    var body = document.createElement("div"); body.className = "card-body";' +
+    '    var name = document.createElement("div"); name.className = "row-name"; name.textContent = p.row + (p.kind === "create" ? "  ·  NEW ROW" : "  ·  " + (p.column || ""));' +
+    '    body.appendChild(name);' +
+    '    if (p.kind === "update"){' +
+    '      var diff = document.createElement("div"); diff.className = "diff";' +
+    '      diff.textContent = (p.from || "(empty)") + "   →   " + p.to;' +
+    '      body.appendChild(diff);' +
+    '    }' +
+    '    if (p.reason){' +
+    '      var r = document.createElement("div"); r.className = "reason"; r.textContent = p.reason;' +
+    '      body.appendChild(r);' +
+    '    }' +
+    '    card.appendChild(cb); card.appendChild(body); list.appendChild(card);' +
+    '  });' +
+    '  document.getElementById("all").addEventListener("change", function(){' +
+    '    var v = this.checked;' +
+    '    var boxes = list.querySelectorAll("input[type=checkbox]");' +
+    '    for (var i = 0; i < boxes.length; i++) boxes[i].checked = v;' +
+    '  });' +
+    '  document.getElementById("cancel").addEventListener("click", function(){ google.script.host.close(); });' +
+    '  document.getElementById("apply").addEventListener("click", function(){' +
+    '    var btn = this; btn.disabled = true;' +
+    '    document.getElementById("status").textContent = "Applying…";' +
+    '    var selected = [];' +
+    '    var boxes = list.querySelectorAll("input[type=checkbox]");' +
+    '    for (var i = 0; i < boxes.length; i++) {' +
+    '      if (boxes[i].checked) selected.push(PROPS[parseInt(boxes[i].dataset.idx, 10)]);' +
+    '    }' +
+    '    google.script.run' +
+    '      .withSuccessHandler(function(res){' +
+    '        document.getElementById("status").textContent = "Applied " + res.applied + (res.skipped.length ? ", skipped " + res.skipped.length : "");' +
+    '        setTimeout(function(){ google.script.host.close(); }, 1500);' +
+    '      })' +
+    '      .withFailureHandler(function(e){ document.getElementById("status").textContent = "Error: " + e.message; btn.disabled = false; })' +
+    '      .applyDiffProposals(selected);' +
+    '  });' +
+    '</script></body></html>';
+}
+
+// ============================================================
+// AI DIFF MODES — Mode 1 / 2 / 3 / 4
+// ============================================================
+
+function suggestTierPriorityStatusAi() {
+  var rows = gatherInFlightRows_();
+  if (rows.length === 0) { SpreadsheetApp.getUi().alert("No in-flight rows."); return; }
+
+  var prompt = "Review this portfolio of bets. For each row, check if Notes / Status / context contradicts the current Tier / Priority / Status dropdown values.\n\n" +
+    "Only propose changes when there's STRONG signal — don't propose routine adjustments.\n\n" +
+    "Return JSON ONLY (no markdown, no commentary) in this exact shape:\n" +
+    '{ "proposals": [ { "id": "<unique>", "kind": "update", "row": "<exact Innovation name>", "column": "<status|tier|priority>", "from": "<current value>", "to": "<new value>", "reason": "<why>" } ] }\n\n' +
+    "Valid status values: " + STATUS_OPTIONS.join(" | ") + "\n" +
+    "Valid tier values: " + TIER_OPTIONS.join(" | ") + "\n" +
+    "Valid priority values: " + PRIORITY_OPTIONS.join(" | ") + "\n\n" +
+    "Limit to 5 proposals max.\n\n" +
+    "Portfolio:\n" + JSON.stringify(rows, null, 2);
+
+  runDiffMode_("suggestDropdowns", "Suggest tier / priority / status", prompt);
+}
+
+function flagRisksAi() {
+  var rows = gatherInFlightRows_();
+  if (rows.length === 0) { SpreadsheetApp.getUi().alert("No in-flight rows."); return; }
+
+  var prompt = "Audit this portfolio for risk signals. Surface proposals when:\n" +
+    "- A row is significantly stale (Last Updated > 14 days ago) and not Done/Paused/Idea\n" +
+    "- Notes mention blockers, delays, kill criteria met, or RAM/CPU/perf problems\n" +
+    "- A row should probably move to Paused / Fixing / Waiting based on signal\n\n" +
+    "Today's date: " + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd") + "\n\n" +
+    "Return JSON ONLY in this shape:\n" +
+    '{ "proposals": [ { "id": "<unique>", "kind": "update", "row": "<exact name>", "column": "status", "from": "<current>", "to": "<new>", "reason": "<why>" } ] }\n\n' +
+    "Valid status values: " + STATUS_OPTIONS.join(" | ") + "\n\n" +
+    "Limit to 5 proposals.\n\n" +
+    "Portfolio:\n" + JSON.stringify(rows, null, 2);
+
+  runDiffMode_("flagRisks", "Flag risks & stale work", prompt);
+}
+
+function draftHypothesesAi() {
+  var allRows = gatherInFlightRows_();
+  // Also include Idea rows (gatherInFlightRows_ already includes Idea since it only excludes Done/Paused)
+  var ideaRows = allRows.filter(function(r) { return r.status === STATUS.IDEA; });
+  if (ideaRows.length === 0) { SpreadsheetApp.getUi().alert("No Idea rows to draft hypotheses for."); return; }
+
+  // Enrich with current hypothesis state
+  var enriched = ideaRows.map(function(r) {
+    var d = getBetDetail_(r.innovation);
+    return {
+      innovation: r.innovation,
+      investigator: r.investigator,
+      tier: r.tier,
+      notes: r.notes,
+      currentHypothesis: d.hypothesis || ""
+    };
+  }).filter(function(r) { return r.currentHypothesis === ""; });
+
+  if (enriched.length === 0) { SpreadsheetApp.getUi().alert("All Idea rows already have hypotheses set."); return; }
+
+  var prompt = "For each Idea row that has an empty Hypothesis, draft a one-line hypothesis.\n\n" +
+    "Format: \"If [we do X], [Y will happen] because [Z].\"\n\n" +
+    "Use the Innovation name + Notes to ground the hypothesis. Be specific. Don't invent details.\n\n" +
+    "Return JSON ONLY in this shape:\n" +
+    '{ "proposals": [ { "id": "<unique>", "kind": "update", "row": "<exact name>", "column": "hypothesis", "from": "", "to": "<draft hypothesis>", "reason": "<grounding>" } ] }\n\n' +
+    "Idea rows missing hypothesis:\n" + JSON.stringify(enriched, null, 2);
+
+  runDiffMode_("draftHypotheses", "Draft missing hypotheses", prompt);
+}
+
+function proposeNewPebblesAi() {
+  var rows = gatherInFlightRows_();
+  if (rows.length === 0) { SpreadsheetApp.getUi().alert("No in-flight rows for context."); return; }
+
+  var prompt = "Based on this portfolio of bets, propose 3-5 NEW Pebble-tier experiments that would unblock or de-risk current work.\n\n" +
+    "A good Pebble is:\n" +
+    "- Small (1-3 hours of work)\n" +
+    "- Generates evidence for a bigger bet in the portfolio\n" +
+    "- Specific and actionable (e.g. 'Spike Claude API for X' not 'Try AI')\n\n" +
+    "Return JSON ONLY in this shape:\n" +
+    '{ "proposals": [ { "id": "<unique>", "kind": "create", "row": "<bet name>", "data": { "innovation": "<bet name>", "investigator": "<best owner>", "tier": "🔹 Pebble", "priority": "🟡 Medium", "status": "Idea" }, "reason": "<which bigger bet this unblocks>" } ] }\n\n' +
+    "Use existing Investigators when picking owners. Limit to 5 proposals.\n\n" +
+    "Portfolio:\n" + JSON.stringify(rows, null, 2);
+
+  runDiffMode_("proposePebbles", "Propose new Pebble experiments", prompt);
 }
 
 // ============================================================
