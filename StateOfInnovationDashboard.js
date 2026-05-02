@@ -178,6 +178,8 @@ function onOpen() {
     .addSubMenu(
       SpreadsheetApp.getUi().createMenu("AI")
         .addItem("Explain this row", "explainRowWithAi")
+        .addItem("What should I work on next?", "whatToWorkOnAi")
+        .addItem("Draft this week's standup", "draftStandupAi")
     )
     .addSubMenu(
       SpreadsheetApp.getUi().createMenu("Maintenance")
@@ -1192,6 +1194,117 @@ function buildExplainRowPrompt_(rowValues, detail) {
     lines.push("- Decision log: (no entries yet)");
   }
   return lines.join("\n");
+}
+
+function gatherInFlightRows_() {
+  var sheet = SpreadsheetApp.getActiveSheet();
+  var lastRow = sheet.getLastRow();
+  if (lastRow < CONFIG.dataStartRow) return [];
+
+  var values = sheet.getRange(CONFIG.dataStartRow, 1, lastRow - CONFIG.dataStartRow + 1, CONFIG.numCols).getValues();
+  var out = [];
+
+  for (var i = 0; i < values.length; i++) {
+    var r = values[i];
+    var name = clean_(r[COL.innovation]).replace(/^(\[\d+d\]\s+)+/, "");
+    if (!name || isDividerValue_(name)) continue;
+    var status = clean_(r[COL.status]);
+    if (status === STATUS.DONE || status === STATUS.PAUSED) continue;
+
+    out.push({
+      innovation: name,
+      investigator: clean_(r[COL.investigator]),
+      tier: clean_(r[COL.tier]),
+      priority: clean_(r[COL.priority]),
+      status: status,
+      confidence: clean_(r[COL.confidence]),
+      lastUpdated: r[COL.updated] instanceof Date
+        ? Utilities.formatDate(r[COL.updated], Session.getScriptTimeZone(), "yyyy-MM-dd")
+        : clean_(r[COL.updated]),
+      notes: clean_(r[COL.notes])
+    });
+  }
+  return out;
+}
+
+function gatherRecentlyUpdatedRows_(daysAgo) {
+  var sheet = SpreadsheetApp.getActiveSheet();
+  var lastRow = sheet.getLastRow();
+  if (lastRow < CONFIG.dataStartRow) return [];
+
+  var cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - daysAgo);
+
+  var values = sheet.getRange(CONFIG.dataStartRow, 1, lastRow - CONFIG.dataStartRow + 1, CONFIG.numCols).getValues();
+  var out = [];
+
+  for (var i = 0; i < values.length; i++) {
+    var r = values[i];
+    var name = clean_(r[COL.innovation]).replace(/^(\[\d+d\]\s+)+/, "");
+    if (!name || isDividerValue_(name)) continue;
+
+    var raw = r[COL.updated];
+    var when = raw instanceof Date ? raw : (raw ? new Date(raw) : null);
+    if (!when || isNaN(when.getTime()) || when < cutoff) continue;
+
+    out.push({
+      innovation: name,
+      investigator: clean_(r[COL.investigator]),
+      tier: clean_(r[COL.tier]),
+      priority: clean_(r[COL.priority]),
+      status: clean_(r[COL.status]),
+      confidence: clean_(r[COL.confidence]),
+      lastUpdated: Utilities.formatDate(when, Session.getScriptTimeZone(), "yyyy-MM-dd"),
+      notes: clean_(r[COL.notes])
+    });
+  }
+  return out;
+}
+
+function whatToWorkOnAi() {
+  var ui = SpreadsheetApp.getUi();
+  var rows = gatherInFlightRows_();
+  if (rows.length === 0) { ui.alert("No in-flight rows to analyze."); return; }
+
+  var prompt = "Look at this portfolio of in-flight bets. Recommend the TOP 3 to work on today, ranked by a mix of priority, confidence, staleness (older Last Updated = staler), and signal in the notes.\n\n" +
+    "For each pick, give: (1) the bet name, (2) why it's #1/#2/#3, (3) one concrete next action. Use markdown.\n\n" +
+    "Portfolio:\n" + JSON.stringify(rows, null, 2);
+
+  var result;
+  try {
+    result = callGemini_(prompt, { mode: "whatToWorkOn", maxOutputTokens: 1200 });
+  } catch (e) {
+    ui.alert("AI call failed: " + e.message);
+    return;
+  }
+
+  var html = HtmlService.createHtmlOutput(aiResultModalHtml_("What should I work on next?", result.text, result.totalTokens))
+    .setWidth(560).setHeight(620);
+  ui.showModalDialog(html, "AI · Pick what's next");
+}
+
+function draftStandupAi() {
+  var ui = SpreadsheetApp.getUi();
+  var recent = gatherRecentlyUpdatedRows_(7);
+  if (recent.length === 0) { ui.alert("No rows updated in the last 7 days — nothing to standup about."); return; }
+
+  var prompt = "Generate a weekly standup update in markdown for these bets that moved in the last 7 days.\n\n" +
+    "Format with these sections (omit any that are empty):\n" +
+    "## Shipped\n## In flight\n## Blocked / Waiting\n## Next up\n\n" +
+    "Keep each item to one line. Use the Status field to bucket. Use the Investigator field to attribute (e.g. \"Antonio\"). Don't invent details — only use what's in the data.\n\n" +
+    "Recent activity:\n" + JSON.stringify(recent, null, 2);
+
+  var result;
+  try {
+    result = callGemini_(prompt, { mode: "draftStandup", maxOutputTokens: 1500 });
+  } catch (e) {
+    ui.alert("AI call failed: " + e.message);
+    return;
+  }
+
+  var html = HtmlService.createHtmlOutput(aiResultModalHtml_("Standup · last 7 days", result.text, result.totalTokens))
+    .setWidth(560).setHeight(620);
+  ui.showModalDialog(html, "AI · Standup draft");
 }
 
 function aiResultModalHtml_(title, markdown, totalTokens) {
