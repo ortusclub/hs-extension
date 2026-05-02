@@ -176,6 +176,10 @@ function onOpen() {
     .addItem("Show tier legend", "showTierLegend")
     .addSeparator()
     .addSubMenu(
+      SpreadsheetApp.getUi().createMenu("AI")
+        .addItem("Explain this row", "explainRowWithAi")
+    )
+    .addSubMenu(
       SpreadsheetApp.getUi().createMenu("Maintenance")
         .addItem("Migrate to Phase 1a schema", "migrateToPhase1aSchema")
         .addItem("Migrate Last Updated to Date format", "migrateLastUpdatedToDate")
@@ -1006,6 +1010,220 @@ function openSettings() {
   sheet.showSheet();
   SpreadsheetApp.getActive().setActiveSheet(sheet);
   toast_("Settings sheet shown. Hide it again from the sheet tab when done.");
+}
+
+// ============================================================
+// AI — Gemini Flash client + telemetry + Explain Row mode
+// ============================================================
+// API key hardcoded per user request. Rotate periodically at
+// aistudio.google.com/app/apikey if you suspect exposure.
+// ============================================================
+
+var GEMINI_API_KEY = "AIzaSyD9eEQ4_0ADLrOe0zaAaAhi2zX8Bnm8pFI";
+var GEMINI_MODEL = "gemini-2.0-flash-exp";
+var GEMINI_DAILY_TOKEN_BUDGET = 200000;
+
+var AI_LOG_SHEET_NAME = "_AILog";
+var AI_LOG_HEADERS = ["when", "mode", "inputTokens", "outputTokens", "totalTokens", "success", "errorMessage"];
+var AILOG_COL = { when: 0, mode: 1, inputTokens: 2, outputTokens: 3, totalTokens: 4, success: 5, errorMessage: 6 };
+
+function ensureAILogSheet_() {
+  var ss = SpreadsheetApp.getActive();
+  var sheet = ss.getSheetByName(AI_LOG_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(AI_LOG_SHEET_NAME);
+    sheet.getRange(1, 1, 1, AI_LOG_HEADERS.length).setValues([AI_LOG_HEADERS])
+      .setFontWeight("bold").setBackground(CONFIG.colors.headerBg).setFontColor(CONFIG.colors.headerFg);
+    sheet.setColumnWidths(1, AI_LOG_HEADERS.length, 140);
+    sheet.setColumnWidth(AILOG_COL.errorMessage + 1, 320);
+    sheet.setFrozenRows(1);
+    sheet.hideSheet();
+  }
+  return sheet;
+}
+
+function appendAILogEntry_(entry) {
+  var sheet = ensureAILogSheet_();
+  sheet.appendRow([
+    entry.when || new Date(),
+    entry.mode || "",
+    entry.inputTokens || 0,
+    entry.outputTokens || 0,
+    entry.totalTokens || 0,
+    entry.success === true,
+    entry.errorMessage || ""
+  ]);
+}
+
+function tokensSpentToday_() {
+  var sheet = ensureAILogSheet_();
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return 0;
+  var todayKey = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd");
+  var rows = sheet.getRange(2, 1, lastRow - 1, AI_LOG_HEADERS.length).getValues();
+  var sum = 0;
+  for (var i = 0; i < rows.length; i++) {
+    var when = rows[i][AILOG_COL.when];
+    if (when instanceof Date) {
+      var k = Utilities.formatDate(when, Session.getScriptTimeZone(), "yyyy-MM-dd");
+      if (k === todayKey) sum += parseInt(rows[i][AILOG_COL.totalTokens], 10) || 0;
+    }
+  }
+  return sum;
+}
+
+function callGemini_(prompt, options) {
+  options = options || {};
+  var mode = options.mode || "generic";
+
+  var spent = tokensSpentToday_();
+  if (spent >= GEMINI_DAILY_TOKEN_BUDGET) {
+    appendAILogEntry_({ mode: mode, success: false, errorMessage: "Daily budget exhausted (" + spent + ")" });
+    throw new Error("Daily token budget exhausted (" + spent + " / " + GEMINI_DAILY_TOKEN_BUDGET + "). Try again tomorrow.");
+  }
+
+  var url = "https://generativelanguage.googleapis.com/v1beta/models/" + GEMINI_MODEL +
+            ":generateContent?key=" + encodeURIComponent(GEMINI_API_KEY);
+  var body = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: {
+      temperature: options.temperature != null ? options.temperature : 0.4,
+      maxOutputTokens: options.maxOutputTokens || 1024
+    }
+  };
+
+  var response;
+  try {
+    response = UrlFetchApp.fetch(url, {
+      method: "post", contentType: "application/json",
+      payload: JSON.stringify(body), muteHttpExceptions: true
+    });
+  } catch (e) {
+    appendAILogEntry_({ mode: mode, success: false, errorMessage: "Network: " + e.message });
+    throw e;
+  }
+
+  var code = response.getResponseCode();
+  var raw = response.getContentText();
+  if (code !== 200) {
+    appendAILogEntry_({ mode: mode, success: false, errorMessage: "HTTP " + code + ": " + raw.substring(0, 200) });
+    throw new Error("Gemini HTTP " + code + ": " + raw.substring(0, 300));
+  }
+
+  var data;
+  try { data = JSON.parse(raw); } catch (e) {
+    appendAILogEntry_({ mode: mode, success: false, errorMessage: "Bad JSON: " + raw.substring(0, 200) });
+    throw new Error("Gemini returned non-JSON: " + raw.substring(0, 300));
+  }
+
+  var text = "";
+  if (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) {
+    text = data.candidates[0].content.parts.map(function(p) { return p.text || ""; }).join("");
+  }
+
+  var usage = data.usageMetadata || {};
+  var inT = usage.promptTokenCount || 0;
+  var outT = usage.candidatesTokenCount || 0;
+  var totT = usage.totalTokenCount || (inT + outT);
+
+  appendAILogEntry_({ mode: mode, inputTokens: inT, outputTokens: outT, totalTokens: totT, success: true });
+
+  return { text: text, inputTokens: inT, outputTokens: outT, totalTokens: totT };
+}
+
+function explainRowWithAi() {
+  var ui = SpreadsheetApp.getUi();
+  var sheet = SpreadsheetApp.getActiveSheet();
+  var range = sheet.getActiveRange();
+  if (!range) { ui.alert("Pick a row first."); return; }
+
+  var row = range.getRow();
+  if (row < CONFIG.dataStartRow) { ui.alert("Click a data row (not the header)."); return; }
+
+  var rowValues = sheet.getRange(row, 1, 1, CONFIG.numCols).getValues()[0];
+  var innovation = clean_(rowValues[COL.innovation]);
+  if (!innovation || isDividerValue_(innovation)) {
+    ui.alert("Pick a real bet row (not a divider).");
+    return;
+  }
+
+  var detail = getBetDetail_(innovation);
+  var prompt = buildExplainRowPrompt_(rowValues, detail);
+
+  var result;
+  try {
+    result = callGemini_(prompt, { mode: "explainRow", maxOutputTokens: 800 });
+  } catch (e) {
+    ui.alert("AI call failed: " + e.message);
+    return;
+  }
+
+  var html = HtmlService.createHtmlOutput(aiResultModalHtml_("Explain · " + innovation, result.text, result.totalTokens))
+    .setWidth(560).setHeight(560);
+  ui.showModalDialog(html, "AI Explanation");
+}
+
+function buildExplainRowPrompt_(rowValues, detail) {
+  var lines = [];
+  lines.push("Explain this bet to me in plain English. Cover what it is, where it stands, what's at risk, and what's next.");
+  lines.push("Keep it tight — 4–6 short markdown sections, no fluff.");
+  lines.push("");
+  lines.push("Bet data:");
+  lines.push("- Innovation: " + clean_(rowValues[COL.innovation]).replace(/^(\[\d+d\]\s+)+/, ""));
+  lines.push("- Investigator: " + clean_(rowValues[COL.investigator]));
+  lines.push("- Tier: " + clean_(rowValues[COL.tier]));
+  lines.push("- Priority: " + clean_(rowValues[COL.priority]));
+  lines.push("- Status: " + clean_(rowValues[COL.status]));
+  lines.push("- Confidence: " + clean_(rowValues[COL.confidence]));
+  lines.push("- Last updated: " + clean_(rowValues[COL.updated]));
+  lines.push("- Notes: " + clean_(rowValues[COL.notes]));
+  lines.push("- Link: " + clean_(rowValues[COL.link]));
+  lines.push("");
+  lines.push("Narrative fields:");
+  lines.push("- Hypothesis: " + (detail.hypothesis || "(not set)"));
+  lines.push("- Kill criteria: " + (detail.killCriteria || "(not set)"));
+  lines.push("- Evidence link: " + (detail.evidenceLink || "(not set)"));
+  if (detail.decisionLog && detail.decisionLog.length > 0) {
+    lines.push("- Decision log:");
+    detail.decisionLog.forEach(function(e) {
+      lines.push("  - " + (e.when || "") + " " + (e.transition || "") + ": " + (e.what || ""));
+    });
+  } else {
+    lines.push("- Decision log: (no entries yet)");
+  }
+  return lines.join("\n");
+}
+
+function aiResultModalHtml_(title, markdown, totalTokens) {
+  var safeTitle = title.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  var safeMarkdown = JSON.stringify(markdown);
+  return '' +
+    '<!DOCTYPE html><html><head><base target="_top">' +
+    '<style>' +
+    '  body{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#0a0a0a;background:#fafafa;margin:0;padding:20px;}' +
+    '  .eyebrow{font-size:9px;font-weight:700;letter-spacing:0.18em;text-transform:uppercase;color:#999;margin-bottom:4px;}' +
+    '  h1{font-size:18px;margin:0 0 14px;line-height:1.3;}' +
+    '  .body{background:#fff;border:1px solid rgba(0,0,0,0.1);padding:16px 20px;font-size:13px;line-height:1.55;color:#0a0a0a;white-space:pre-wrap;word-wrap:break-word;max-height:380px;overflow-y:auto;}' +
+    '  .actions{display:flex;gap:8px;margin-top:14px;align-items:center;}' +
+    '  button{font-family:inherit;font-size:11px;font-weight:700;letter-spacing:0.16em;text-transform:uppercase;padding:9px 18px;cursor:pointer;border:1px solid #0a0a0a;background:#0a0a0a;color:#F7BE68;}' +
+    '  button.secondary{background:#fff;color:#0a0a0a;}' +
+    '  .meta{font-size:10px;color:#999;margin-left:auto;}' +
+    '  .copied{color:#2E8B3D;font-weight:700;}' +
+    '</style></head><body>' +
+    '<div class="eyebrow">AI Result · Gemini</div>' +
+    '<h1>' + safeTitle + '</h1>' +
+    '<div class="body" id="body"></div>' +
+    '<div class="actions"><button id="copy">Copy as markdown</button><button class="secondary" id="close">Close</button><span class="meta">' + totalTokens + ' tokens</span></div>' +
+    '<script>' +
+    '  var MD = ' + safeMarkdown + ';' +
+    '  document.getElementById("body").textContent = MD;' +
+    '  document.getElementById("copy").addEventListener("click", function(){' +
+    '    var ta = document.createElement("textarea"); ta.value = MD; document.body.appendChild(ta);' +
+    '    ta.select(); document.execCommand("copy"); document.body.removeChild(ta);' +
+    '    this.textContent = "Copied"; this.classList.add("copied");' +
+    '  });' +
+    '  document.getElementById("close").addEventListener("click", function(){ google.script.host.close(); });' +
+    '</script></body></html>';
 }
 
 // ============================================================
