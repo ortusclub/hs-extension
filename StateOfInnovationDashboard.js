@@ -1020,191 +1020,12 @@ function openSettings() {
 }
 
 // ============================================================
-// AI — Gemini Flash client + telemetry + Explain Row mode
+// AI — prompt generators (you paste into Claude.ai / ChatGPT / Gemini)
 // ============================================================
-// API key hardcoded per user request. Rotate periodically at
-// aistudio.google.com/app/apikey if you suspect exposure.
+// No API calls. Each mode builds a prompt + your sheet's data context
+// and shows it in a modal with a Copy button. Paste into any AI tool,
+// read the response there, manually act on it.
 // ============================================================
-
-var GEMINI_API_KEY = "AIzaSyD9eEQ4_0ADLrOe0zaAaAhi2zX8Bnm8pFI";
-var GEMINI_MODEL = "gemini-2.0-flash";
-var GEMINI_DAILY_TOKEN_BUDGET = 200000;
-
-var AI_LOG_SHEET_NAME = "_AILog";
-var AI_LOG_HEADERS = ["when", "mode", "inputTokens", "outputTokens", "totalTokens", "success", "errorMessage"];
-var AILOG_COL = { when: 0, mode: 1, inputTokens: 2, outputTokens: 3, totalTokens: 4, success: 5, errorMessage: 6 };
-
-function ensureAILogSheet_() {
-  var ss = SpreadsheetApp.getActive();
-  var sheet = ss.getSheetByName(AI_LOG_SHEET_NAME);
-  if (!sheet) {
-    sheet = ss.insertSheet(AI_LOG_SHEET_NAME);
-    sheet.getRange(1, 1, 1, AI_LOG_HEADERS.length).setValues([AI_LOG_HEADERS])
-      .setFontWeight("bold").setBackground(CONFIG.colors.headerBg).setFontColor(CONFIG.colors.headerFg);
-    sheet.setColumnWidths(1, AI_LOG_HEADERS.length, 140);
-    sheet.setColumnWidth(AILOG_COL.errorMessage + 1, 320);
-    sheet.setFrozenRows(1);
-    sheet.hideSheet();
-  }
-  return sheet;
-}
-
-function appendAILogEntry_(entry) {
-  var sheet = ensureAILogSheet_();
-  sheet.appendRow([
-    entry.when || new Date(),
-    entry.mode || "",
-    entry.inputTokens || 0,
-    entry.outputTokens || 0,
-    entry.totalTokens || 0,
-    entry.success === true,
-    entry.errorMessage || ""
-  ]);
-}
-
-function tokensSpentToday_() {
-  var sheet = ensureAILogSheet_();
-  var lastRow = sheet.getLastRow();
-  if (lastRow < 2) return 0;
-  var todayKey = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd");
-  var rows = sheet.getRange(2, 1, lastRow - 1, AI_LOG_HEADERS.length).getValues();
-  var sum = 0;
-  for (var i = 0; i < rows.length; i++) {
-    var when = rows[i][AILOG_COL.when];
-    if (when instanceof Date) {
-      var k = Utilities.formatDate(when, Session.getScriptTimeZone(), "yyyy-MM-dd");
-      if (k === todayKey) sum += parseInt(rows[i][AILOG_COL.totalTokens], 10) || 0;
-    }
-  }
-  return sum;
-}
-
-function callGemini_(prompt, options) {
-  options = options || {};
-  var mode = options.mode || "generic";
-
-  var spent = tokensSpentToday_();
-  if (spent >= GEMINI_DAILY_TOKEN_BUDGET) {
-    appendAILogEntry_({ mode: mode, success: false, errorMessage: "Daily budget exhausted (" + spent + ")" });
-    throw new Error("Daily token budget exhausted (" + spent + " / " + GEMINI_DAILY_TOKEN_BUDGET + "). Try again tomorrow.");
-  }
-
-  var url = "https://generativelanguage.googleapis.com/v1beta/models/" + GEMINI_MODEL +
-            ":generateContent?key=" + encodeURIComponent(GEMINI_API_KEY);
-  var generationConfig = {
-    temperature: options.temperature != null ? options.temperature : 0.4,
-    maxOutputTokens: options.maxOutputTokens || 1024
-  };
-  if (options.responseMimeType) {
-    generationConfig.responseMimeType = options.responseMimeType;
-  }
-
-  var body = {
-    contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: generationConfig
-  };
-
-  var response;
-  try {
-    response = UrlFetchApp.fetch(url, {
-      method: "post", contentType: "application/json",
-      payload: JSON.stringify(body), muteHttpExceptions: true
-    });
-  } catch (e) {
-    appendAILogEntry_({ mode: mode, success: false, errorMessage: "Network: " + e.message });
-    throw e;
-  }
-
-  var code = response.getResponseCode();
-  var raw = response.getContentText();
-  if (code !== 200) {
-    appendAILogEntry_({ mode: mode, success: false, errorMessage: "HTTP " + code + ": " + raw.substring(0, 200) });
-    throw new Error("Gemini HTTP " + code + ": " + raw.substring(0, 300));
-  }
-
-  var data;
-  try { data = JSON.parse(raw); } catch (e) {
-    appendAILogEntry_({ mode: mode, success: false, errorMessage: "Bad JSON: " + raw.substring(0, 200) });
-    throw new Error("Gemini returned non-JSON: " + raw.substring(0, 300));
-  }
-
-  var text = "";
-  if (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) {
-    text = data.candidates[0].content.parts.map(function(p) { return p.text || ""; }).join("");
-  }
-
-  var usage = data.usageMetadata || {};
-  var inT = usage.promptTokenCount || 0;
-  var outT = usage.candidatesTokenCount || 0;
-  var totT = usage.totalTokenCount || (inT + outT);
-
-  appendAILogEntry_({ mode: mode, inputTokens: inT, outputTokens: outT, totalTokens: totT, success: true });
-
-  return { text: text, inputTokens: inT, outputTokens: outT, totalTokens: totT };
-}
-
-function explainRowWithAi() {
-  var ui = SpreadsheetApp.getUi();
-  var sheet = SpreadsheetApp.getActiveSheet();
-  var range = sheet.getActiveRange();
-  if (!range) { ui.alert("Pick a row first."); return; }
-
-  var row = range.getRow();
-  if (row < CONFIG.dataStartRow) { ui.alert("Click a data row (not the header)."); return; }
-
-  var rowValues = sheet.getRange(row, 1, 1, CONFIG.numCols).getValues()[0];
-  var innovation = clean_(rowValues[COL.innovation]);
-  if (!innovation || isDividerValue_(innovation)) {
-    ui.alert("Pick a real bet row (not a divider).");
-    return;
-  }
-
-  var detail = getBetDetail_(innovation);
-  var prompt = buildExplainRowPrompt_(rowValues, detail);
-
-  var result;
-  try {
-    result = callGemini_(prompt, { mode: "explainRow", maxOutputTokens: 800 });
-  } catch (e) {
-    ui.alert("AI call failed: " + e.message);
-    return;
-  }
-
-  var html = HtmlService.createHtmlOutput(aiResultModalHtml_("Explain · " + innovation, result.text, result.totalTokens))
-    .setWidth(560).setHeight(560);
-  ui.showModalDialog(html, "AI Explanation");
-}
-
-function buildExplainRowPrompt_(rowValues, detail) {
-  var lines = [];
-  lines.push("Explain this bet to me in plain English. Cover what it is, where it stands, what's at risk, and what's next.");
-  lines.push("Keep it tight — 4–6 short markdown sections, no fluff.");
-  lines.push("");
-  lines.push("Bet data:");
-  lines.push("- Innovation: " + clean_(rowValues[COL.innovation]).replace(/^(\[\d+d\]\s+)+/, ""));
-  lines.push("- Investigator: " + clean_(rowValues[COL.investigator]));
-  lines.push("- Tier: " + clean_(rowValues[COL.tier]));
-  lines.push("- Priority: " + clean_(rowValues[COL.priority]));
-  lines.push("- Status: " + clean_(rowValues[COL.status]));
-  lines.push("- Confidence: " + clean_(rowValues[COL.confidence]));
-  lines.push("- Last updated: " + clean_(rowValues[COL.updated]));
-  lines.push("- Notes: " + clean_(rowValues[COL.notes]));
-  lines.push("- Link: " + clean_(rowValues[COL.link]));
-  lines.push("");
-  lines.push("Narrative fields:");
-  lines.push("- Hypothesis: " + (detail.hypothesis || "(not set)"));
-  lines.push("- Kill criteria: " + (detail.killCriteria || "(not set)"));
-  lines.push("- Evidence link: " + (detail.evidenceLink || "(not set)"));
-  if (detail.decisionLog && detail.decisionLog.length > 0) {
-    lines.push("- Decision log:");
-    detail.decisionLog.forEach(function(e) {
-      lines.push("  - " + (e.when || "") + " " + (e.transition || "") + ": " + (e.what || ""));
-    });
-  } else {
-    lines.push("- Decision log: (no entries yet)");
-  }
-  return lines.join("\n");
-}
 
 function gatherInFlightRows_() {
   var sheet = SpreadsheetApp.getActiveSheet();
@@ -1271,339 +1092,64 @@ function gatherRecentlyUpdatedRows_(daysAgo) {
   return out;
 }
 
-function whatToWorkOnAi() {
+function explainRowWithAi() {
   var ui = SpreadsheetApp.getUi();
-  var rows = gatherInFlightRows_();
-  if (rows.length === 0) { ui.alert("No in-flight rows to analyze."); return; }
+  var sheet = SpreadsheetApp.getActiveSheet();
+  var range = sheet.getActiveRange();
+  if (!range) { ui.alert("Pick a row first."); return; }
 
-  var prompt = "Look at this portfolio of in-flight bets. Recommend the TOP 3 to work on today, ranked by a mix of priority, confidence, staleness (older Last Updated = staler), and signal in the notes.\n\n" +
-    "For each pick, give: (1) the bet name, (2) why it's #1/#2/#3, (3) one concrete next action. Use markdown.\n\n" +
-    "Portfolio:\n" + JSON.stringify(rows, null, 2);
+  var row = range.getRow();
+  if (row < CONFIG.dataStartRow) { ui.alert("Click a data row (not the header)."); return; }
 
-  var result;
-  try {
-    result = callGemini_(prompt, { mode: "whatToWorkOn", maxOutputTokens: 1200 });
-  } catch (e) {
-    ui.alert("AI call failed: " + e.message);
+  var rowValues = sheet.getRange(row, 1, 1, CONFIG.numCols).getValues()[0];
+  var innovation = clean_(rowValues[COL.innovation]);
+  if (!innovation || isDividerValue_(innovation)) {
+    ui.alert("Pick a real bet row (not a divider).");
     return;
   }
 
-  var html = HtmlService.createHtmlOutput(aiResultModalHtml_("What should I work on next?", result.text, result.totalTokens))
-    .setWidth(560).setHeight(620);
-  ui.showModalDialog(html, "AI · Pick what's next");
+  var detail = getBetDetail_(innovation);
+  var prompt = buildExplainRowPrompt_(rowValues, detail);
+  showAiPrompt_("Explain · " + innovation, prompt,
+    "Paste into Claude.ai / ChatGPT / Gemini chat. Read the explanation there.");
+}
+
+function whatToWorkOnAi() {
+  var rows = gatherInFlightRows_();
+  if (rows.length === 0) { SpreadsheetApp.getUi().alert("No in-flight rows to analyze."); return; }
+  var prompt = buildWhatToWorkOnPrompt_(rows);
+  showAiPrompt_("What should I work on next?", prompt,
+    "Paste into your AI tool. It'll rank your top 3 bets to work on today.");
 }
 
 function draftStandupAi() {
-  var ui = SpreadsheetApp.getUi();
   var recent = gatherRecentlyUpdatedRows_(7);
-  if (recent.length === 0) { ui.alert("No rows updated in the last 7 days — nothing to standup about."); return; }
-
-  var prompt = "Generate a weekly standup update in markdown for these bets that moved in the last 7 days.\n\n" +
-    "Format with these sections (omit any that are empty):\n" +
-    "## Shipped\n## In flight\n## Blocked / Waiting\n## Next up\n\n" +
-    "Keep each item to one line. Use the Status field to bucket. Use the Investigator field to attribute (e.g. \"Antonio\"). Don't invent details — only use what's in the data.\n\n" +
-    "Recent activity:\n" + JSON.stringify(recent, null, 2);
-
-  var result;
-  try {
-    result = callGemini_(prompt, { mode: "draftStandup", maxOutputTokens: 1500 });
-  } catch (e) {
-    ui.alert("AI call failed: " + e.message);
-    return;
-  }
-
-  var html = HtmlService.createHtmlOutput(aiResultModalHtml_("Standup · last 7 days", result.text, result.totalTokens))
-    .setWidth(560).setHeight(620);
-  ui.showModalDialog(html, "AI · Standup draft");
+  if (recent.length === 0) { SpreadsheetApp.getUi().alert("No rows updated in the last 7 days."); return; }
+  var prompt = buildStandupPrompt_(recent);
+  showAiPrompt_("Standup · last 7 days", prompt,
+    "Paste into your AI tool. The reply is markdown — paste it into Slack/Notion.");
 }
-
-function aiResultModalHtml_(title, markdown, totalTokens) {
-  var safeTitle = title.replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  var safeMarkdown = JSON.stringify(markdown);
-  return '' +
-    '<!DOCTYPE html><html><head><base target="_top">' +
-    '<style>' +
-    '  body{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#0a0a0a;background:#fafafa;margin:0;padding:20px;}' +
-    '  .eyebrow{font-size:9px;font-weight:700;letter-spacing:0.18em;text-transform:uppercase;color:#999;margin-bottom:4px;}' +
-    '  h1{font-size:18px;margin:0 0 14px;line-height:1.3;}' +
-    '  .body{background:#fff;border:1px solid rgba(0,0,0,0.1);padding:16px 20px;font-size:13px;line-height:1.55;color:#0a0a0a;white-space:pre-wrap;word-wrap:break-word;max-height:380px;overflow-y:auto;}' +
-    '  .actions{display:flex;gap:8px;margin-top:14px;align-items:center;}' +
-    '  button{font-family:inherit;font-size:11px;font-weight:700;letter-spacing:0.16em;text-transform:uppercase;padding:9px 18px;cursor:pointer;border:1px solid #0a0a0a;background:#0a0a0a;color:#F7BE68;}' +
-    '  button.secondary{background:#fff;color:#0a0a0a;}' +
-    '  .meta{font-size:10px;color:#999;margin-left:auto;}' +
-    '  .copied{color:#2E8B3D;font-weight:700;}' +
-    '</style></head><body>' +
-    '<div class="eyebrow">AI Result · Gemini</div>' +
-    '<h1>' + safeTitle + '</h1>' +
-    '<div class="body" id="body"></div>' +
-    '<div class="actions"><button id="copy">Copy as markdown</button><button class="secondary" id="close">Close</button><span class="meta">' + totalTokens + ' tokens</span></div>' +
-    '<script>' +
-    '  var MD = ' + safeMarkdown + ';' +
-    '  document.getElementById("body").textContent = MD;' +
-    '  document.getElementById("copy").addEventListener("click", function(){' +
-    '    var ta = document.createElement("textarea"); ta.value = MD; document.body.appendChild(ta);' +
-    '    ta.select(); document.execCommand("copy"); document.body.removeChild(ta);' +
-    '    this.textContent = "Copied"; this.classList.add("copied");' +
-    '  });' +
-    '  document.getElementById("close").addEventListener("click", function(){ google.script.host.close(); });' +
-    '</script></body></html>';
-}
-
-// ============================================================
-// AI DIFF INFRASTRUCTURE — proposes changes, you accept/reject, applies
-// ============================================================
-
-function callGeminiJson_(prompt, options) {
-  options = options || {};
-  options.responseMimeType = "application/json";
-  return callGemini_(prompt, options);
-}
-
-// Patched callGemini_ to honor responseMimeType when present (for JSON outputs).
-// We do this by wrapping — see the actual change inside callGemini_'s body
-// in the existing AI section above. (No-op shim if already supported.)
-
-function findRowByInnovation_(sheet, innovationName) {
-  var lastRow = sheet.getLastRow();
-  if (lastRow < CONFIG.dataStartRow) return -1;
-  var values = sheet.getRange(CONFIG.dataStartRow, COL.innovation + 1, lastRow - CONFIG.dataStartRow + 1, 1).getValues();
-  var target = clean_(innovationName);
-  for (var i = 0; i < values.length; i++) {
-    var name = clean_(values[i][0]).replace(/^(\[\d+d\]\s+)+/, "");
-    if (name === target) return CONFIG.dataStartRow + i;
-  }
-  return -1;
-}
-
-var DIFF_SHEET_COLUMNS = {
-  status: COL.status,
-  tier: COL.tier,
-  priority: COL.priority,
-  confidence: COL.confidence,
-  notes: COL.notes
-};
-
-var DIFF_NARRATIVE_COLUMNS = ["hypothesis", "killCriteria", "evidenceLink"];
-
-function applyDiffProposals(proposals) {
-  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Innovations") || SpreadsheetApp.getActiveSheet();
-  // Try the active sheet too in case the user is on it
-  var activeSheet = SpreadsheetApp.getActiveSheet();
-  if (activeSheet.getRange(1, COL.innovation + 1).getValue() === HEADERS[COL.innovation]) {
-    sheet = activeSheet;
-  }
-
-  var applied = 0;
-  var skipped = [];
-  var today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd");
-
-  proposals.forEach(function(p) {
-    try {
-      if (p.kind === "update") {
-        var rowIdx = findRowByInnovation_(sheet, p.row);
-        if (rowIdx < 0) { skipped.push(p.row + ": row not found"); return; }
-
-        if (DIFF_SHEET_COLUMNS.hasOwnProperty(p.column)) {
-          sheet.getRange(rowIdx, DIFF_SHEET_COLUMNS[p.column] + 1).setValue(p.to);
-          appendDecisionLogEntry_(p.row, {
-            when: today,
-            transition: p.column + ": " + (p.from || "(empty)") + " → " + p.to,
-            what: p.reason || "",
-            who: "AI triage"
-          });
-          applied += 1;
-        } else if (DIFF_NARRATIVE_COLUMNS.indexOf(p.column) !== -1) {
-          var fields = {};
-          fields[p.column] = p.to;
-          setBetDetail_(p.row, fields);
-          appendDecisionLogEntry_(p.row, {
-            when: today,
-            transition: p.column + " set",
-            what: p.reason || "",
-            who: "AI triage"
-          });
-          applied += 1;
-        } else {
-          skipped.push(p.row + ": unknown column '" + p.column + "'");
-        }
-      } else if (p.kind === "create") {
-        var lastRow = sheet.getLastRow();
-        var newRow = [];
-        for (var c = 0; c < CONFIG.numCols; c++) newRow.push("");
-        var d = p.data || {};
-        newRow[COL.innovation] = clean_(d.innovation || p.row);
-        newRow[COL.investigator] = clean_(d.investigator);
-        newRow[COL.tier] = clean_(d.tier);
-        newRow[COL.priority] = clean_(d.priority);
-        newRow[COL.status] = clean_(d.status) || STATUS.IDEA;
-        newRow[COL.notes] = clean_(d.notes);
-        newRow[COL.updated] = new Date();
-        sheet.appendRow(newRow);
-        applied += 1;
-      } else {
-        skipped.push((p.row || "?") + ": unknown kind '" + p.kind + "'");
-      }
-    } catch (e) {
-      skipped.push((p.row || "?") + ": " + e.message);
-    }
-  });
-
-  return { applied: applied, skipped: skipped };
-}
-
-function runDiffMode_(modeId, modeLabel, prompt) {
-  var ui = SpreadsheetApp.getUi();
-  var raw;
-  try {
-    raw = callGemini_(prompt, { mode: modeId, maxOutputTokens: 2400, responseMimeType: "application/json" });
-  } catch (e) {
-    ui.alert("AI call failed: " + e.message);
-    return;
-  }
-
-  var parsed;
-  try {
-    parsed = JSON.parse(raw.text);
-  } catch (e) {
-    ui.alert("Gemini returned non-JSON output. Raw response:\n\n" + raw.text.substring(0, 500));
-    return;
-  }
-
-  var proposals = (parsed && parsed.proposals) || [];
-  if (proposals.length === 0) {
-    ui.alert("No proposals returned. Either Gemini found nothing actionable, or the prompt needs tuning.");
-    return;
-  }
-
-  var html = HtmlService.createHtmlOutput(diffReviewModalHtml_(modeLabel, proposals, raw.totalTokens))
-    .setWidth(720).setHeight(640);
-  ui.showModalDialog(html, "AI Triage · " + modeLabel);
-}
-
-function diffReviewModalHtml_(modeLabel, proposals, totalTokens) {
-  var safeLabel = modeLabel.replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  var safeProposals = JSON.stringify(proposals);
-  return '' +
-    '<!DOCTYPE html><html><head><base target="_top">' +
-    '<style>' +
-    '  body{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#0a0a0a;background:#fafafa;margin:0;padding:18px;}' +
-    '  .eyebrow{font-size:9px;font-weight:700;letter-spacing:0.18em;text-transform:uppercase;color:#999;margin-bottom:4px;}' +
-    '  h1{font-size:18px;margin:0 0 4px;line-height:1.3;}' +
-    '  .meta{font-size:11px;color:#666;margin-bottom:14px;}' +
-    '  .list{max-height:430px;overflow-y:auto;border:1px solid rgba(0,0,0,0.1);background:#fff;}' +
-    '  .card{padding:12px 14px;border-bottom:1px solid rgba(0,0,0,0.08);display:flex;gap:12px;align-items:flex-start;}' +
-    '  .card:last-child{border-bottom:0;}' +
-    '  .card input[type=checkbox]{margin-top:3px;width:16px;height:16px;}' +
-    '  .card-body{flex:1;}' +
-    '  .row-name{font-size:12px;font-weight:600;color:#0a0a0a;margin-bottom:4px;}' +
-    '  .diff{font-size:11px;color:#444;margin-bottom:6px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#fafafa;padding:4px 8px;border-left:3px solid #F7BE68;}' +
-    '  .reason{font-size:11px;color:#555;line-height:1.5;}' +
-    '  .actions{display:flex;gap:8px;margin-top:14px;align-items:center;}' +
-    '  button{font-family:inherit;font-size:11px;font-weight:700;letter-spacing:0.16em;text-transform:uppercase;padding:9px 18px;cursor:pointer;border:1px solid #0a0a0a;background:#fff;color:#0a0a0a;}' +
-    '  button.primary{background:#0a0a0a;color:#F7BE68;}' +
-    '  button[disabled]{opacity:0.5;cursor:default;}' +
-    '  .status{font-size:10px;color:#999;margin-left:auto;}' +
-    '  .selectall{font-size:11px;color:#444;margin:0 0 8px;cursor:pointer;}' +
-    '  .selectall input{margin-right:6px;vertical-align:middle;}' +
-    '</style></head><body>' +
-    '<div class="eyebrow">AI Triage · Gemini</div>' +
-    '<h1>' + safeLabel + '</h1>' +
-    '<div class="meta"><span id="count"></span> proposal(s) · ' + totalTokens + ' tokens used</div>' +
-    '<label class="selectall"><input type="checkbox" id="all" checked>Select / deselect all</label>' +
-    '<div class="list" id="list"></div>' +
-    '<div class="actions"><button id="apply" class="primary">Apply selected</button><button id="cancel">Cancel</button><span class="status" id="status"></span></div>' +
-    '<script>' +
-    '  var PROPS = ' + safeProposals + ';' +
-    '  document.getElementById("count").textContent = PROPS.length;' +
-    '  var list = document.getElementById("list");' +
-    '  PROPS.forEach(function(p, i){' +
-    '    var card = document.createElement("div"); card.className = "card";' +
-    '    var cb = document.createElement("input"); cb.type = "checkbox"; cb.checked = true; cb.dataset.idx = i;' +
-    '    var body = document.createElement("div"); body.className = "card-body";' +
-    '    var name = document.createElement("div"); name.className = "row-name"; name.textContent = p.row + (p.kind === "create" ? "  ·  NEW ROW" : "  ·  " + (p.column || ""));' +
-    '    body.appendChild(name);' +
-    '    if (p.kind === "update"){' +
-    '      var diff = document.createElement("div"); diff.className = "diff";' +
-    '      diff.textContent = (p.from || "(empty)") + "   →   " + p.to;' +
-    '      body.appendChild(diff);' +
-    '    }' +
-    '    if (p.reason){' +
-    '      var r = document.createElement("div"); r.className = "reason"; r.textContent = p.reason;' +
-    '      body.appendChild(r);' +
-    '    }' +
-    '    card.appendChild(cb); card.appendChild(body); list.appendChild(card);' +
-    '  });' +
-    '  document.getElementById("all").addEventListener("change", function(){' +
-    '    var v = this.checked;' +
-    '    var boxes = list.querySelectorAll("input[type=checkbox]");' +
-    '    for (var i = 0; i < boxes.length; i++) boxes[i].checked = v;' +
-    '  });' +
-    '  document.getElementById("cancel").addEventListener("click", function(){ google.script.host.close(); });' +
-    '  document.getElementById("apply").addEventListener("click", function(){' +
-    '    var btn = this; btn.disabled = true;' +
-    '    document.getElementById("status").textContent = "Applying…";' +
-    '    var selected = [];' +
-    '    var boxes = list.querySelectorAll("input[type=checkbox]");' +
-    '    for (var i = 0; i < boxes.length; i++) {' +
-    '      if (boxes[i].checked) selected.push(PROPS[parseInt(boxes[i].dataset.idx, 10)]);' +
-    '    }' +
-    '    google.script.run' +
-    '      .withSuccessHandler(function(res){' +
-    '        document.getElementById("status").textContent = "Applied " + res.applied + (res.skipped.length ? ", skipped " + res.skipped.length : "");' +
-    '        setTimeout(function(){ google.script.host.close(); }, 1500);' +
-    '      })' +
-    '      .withFailureHandler(function(e){ document.getElementById("status").textContent = "Error: " + e.message; btn.disabled = false; })' +
-    '      .applyDiffProposals(selected);' +
-    '  });' +
-    '</script></body></html>';
-}
-
-// ============================================================
-// AI DIFF MODES — Mode 1 / 2 / 3 / 4
-// ============================================================
 
 function suggestTierPriorityStatusAi() {
   var rows = gatherInFlightRows_();
   if (rows.length === 0) { SpreadsheetApp.getUi().alert("No in-flight rows."); return; }
-
-  var prompt = "Review this portfolio of bets. For each row, check if Notes / Status / context contradicts the current Tier / Priority / Status dropdown values.\n\n" +
-    "Only propose changes when there's STRONG signal — don't propose routine adjustments.\n\n" +
-    "Return JSON ONLY (no markdown, no commentary) in this exact shape:\n" +
-    '{ "proposals": [ { "id": "<unique>", "kind": "update", "row": "<exact Innovation name>", "column": "<status|tier|priority>", "from": "<current value>", "to": "<new value>", "reason": "<why>" } ] }\n\n' +
-    "Valid status values: " + STATUS_OPTIONS.join(" | ") + "\n" +
-    "Valid tier values: " + TIER_OPTIONS.join(" | ") + "\n" +
-    "Valid priority values: " + PRIORITY_OPTIONS.join(" | ") + "\n\n" +
-    "Limit to 5 proposals max.\n\n" +
-    "Portfolio:\n" + JSON.stringify(rows, null, 2);
-
-  runDiffMode_("suggestDropdowns", "Suggest tier / priority / status", prompt);
+  var prompt = buildSuggestDropdownsPrompt_(rows);
+  showAiPrompt_("Suggest tier / priority / status", prompt,
+    "The AI returns a markdown checklist of suggested dropdown changes. Manually edit the cells you want to apply.");
 }
 
 function flagRisksAi() {
   var rows = gatherInFlightRows_();
   if (rows.length === 0) { SpreadsheetApp.getUi().alert("No in-flight rows."); return; }
-
-  var prompt = "Audit this portfolio for risk signals. Surface proposals when:\n" +
-    "- A row is significantly stale (Last Updated > 14 days ago) and not Done/Paused/Idea\n" +
-    "- Notes mention blockers, delays, kill criteria met, or RAM/CPU/perf problems\n" +
-    "- A row should probably move to Paused / Fixing / Waiting based on signal\n\n" +
-    "Today's date: " + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd") + "\n\n" +
-    "Return JSON ONLY in this shape:\n" +
-    '{ "proposals": [ { "id": "<unique>", "kind": "update", "row": "<exact name>", "column": "status", "from": "<current>", "to": "<new>", "reason": "<why>" } ] }\n\n' +
-    "Valid status values: " + STATUS_OPTIONS.join(" | ") + "\n\n" +
-    "Limit to 5 proposals.\n\n" +
-    "Portfolio:\n" + JSON.stringify(rows, null, 2);
-
-  runDiffMode_("flagRisks", "Flag risks & stale work", prompt);
+  var prompt = buildFlagRisksPrompt_(rows);
+  showAiPrompt_("Flag risks & stale work", prompt,
+    "The AI returns a list of risk signals + suggested actions. Manually act on the ones that look right.");
 }
 
 function draftHypothesesAi() {
-  var allRows = gatherInFlightRows_();
-  // Also include Idea rows (gatherInFlightRows_ already includes Idea since it only excludes Done/Paused)
-  var ideaRows = allRows.filter(function(r) { return r.status === STATUS.IDEA; });
-  if (ideaRows.length === 0) { SpreadsheetApp.getUi().alert("No Idea rows to draft hypotheses for."); return; }
+  var ideaRows = gatherInFlightRows_().filter(function(r) { return r.status === STATUS.IDEA; });
+  if (ideaRows.length === 0) { SpreadsheetApp.getUi().alert("No Idea rows."); return; }
 
-  // Enrich with current hypothesis state
   var enriched = ideaRows.map(function(r) {
     var d = getBetDetail_(r.innovation);
     return {
@@ -1615,33 +1161,151 @@ function draftHypothesesAi() {
     };
   }).filter(function(r) { return r.currentHypothesis === ""; });
 
-  if (enriched.length === 0) { SpreadsheetApp.getUi().alert("All Idea rows already have hypotheses set."); return; }
+  if (enriched.length === 0) { SpreadsheetApp.getUi().alert("All Idea rows already have hypotheses."); return; }
 
-  var prompt = "For each Idea row that has an empty Hypothesis, draft a one-line hypothesis.\n\n" +
-    "Format: \"If [we do X], [Y will happen] because [Z].\"\n\n" +
-    "Use the Innovation name + Notes to ground the hypothesis. Be specific. Don't invent details.\n\n" +
-    "Return JSON ONLY in this shape:\n" +
-    '{ "proposals": [ { "id": "<unique>", "kind": "update", "row": "<exact name>", "column": "hypothesis", "from": "", "to": "<draft hypothesis>", "reason": "<grounding>" } ] }\n\n' +
-    "Idea rows missing hypothesis:\n" + JSON.stringify(enriched, null, 2);
-
-  runDiffMode_("draftHypotheses", "Draft missing hypotheses", prompt);
+  var prompt = buildDraftHypothesesPrompt_(enriched);
+  showAiPrompt_("Draft missing hypotheses", prompt,
+    "The AI drafts a hypothesis per Idea row. Open the Bet Detail sidebar to paste the ones you like into the Hypothesis field.");
 }
 
 function proposeNewPebblesAi() {
   var rows = gatherInFlightRows_();
   if (rows.length === 0) { SpreadsheetApp.getUi().alert("No in-flight rows for context."); return; }
+  var prompt = buildProposePebblesPrompt_(rows);
+  showAiPrompt_("Propose new Pebble experiments", prompt,
+    "The AI proposes 3-5 new bets. Add the ones you like as new rows in the sheet.");
+}
 
-  var prompt = "Based on this portfolio of bets, propose 3-5 NEW Pebble-tier experiments that would unblock or de-risk current work.\n\n" +
-    "A good Pebble is:\n" +
+function buildExplainRowPrompt_(rowValues, detail) {
+  var lines = [];
+  lines.push("Explain this bet to me in plain English. Cover what it is, where it stands, what's at risk, and what's next.");
+  lines.push("Keep it tight — 4-6 short markdown sections, no fluff.");
+  lines.push("");
+  lines.push("Bet data:");
+  lines.push("- Innovation: " + clean_(rowValues[COL.innovation]).replace(/^(\[\d+d\]\s+)+/, ""));
+  lines.push("- Investigator: " + clean_(rowValues[COL.investigator]));
+  lines.push("- Tier: " + clean_(rowValues[COL.tier]));
+  lines.push("- Priority: " + clean_(rowValues[COL.priority]));
+  lines.push("- Status: " + clean_(rowValues[COL.status]));
+  lines.push("- Confidence: " + clean_(rowValues[COL.confidence]));
+  lines.push("- Last updated: " + clean_(rowValues[COL.updated]));
+  lines.push("- Notes: " + clean_(rowValues[COL.notes]));
+  lines.push("- Link: " + clean_(rowValues[COL.link]));
+  lines.push("");
+  lines.push("Narrative fields:");
+  lines.push("- Hypothesis: " + (detail.hypothesis || "(not set)"));
+  lines.push("- Kill criteria: " + (detail.killCriteria || "(not set)"));
+  lines.push("- Evidence link: " + (detail.evidenceLink || "(not set)"));
+  if (detail.decisionLog && detail.decisionLog.length > 0) {
+    lines.push("- Decision log:");
+    detail.decisionLog.forEach(function(e) {
+      lines.push("  - " + (e.when || "") + " " + (e.transition || "") + ": " + (e.what || ""));
+    });
+  } else {
+    lines.push("- Decision log: (no entries yet)");
+  }
+  return lines.join("\n");
+}
+
+function buildWhatToWorkOnPrompt_(rows) {
+  return "Look at this portfolio of in-flight bets. Recommend the TOP 3 to work on today, ranked by a mix of priority, confidence, staleness (older Last Updated = staler), and signal in the notes.\n\n" +
+    "For each pick, give: (1) the bet name, (2) why it's #1/#2/#3, (3) one concrete next action. Use markdown.\n\n" +
+    "Portfolio:\n" + JSON.stringify(rows, null, 2);
+}
+
+function buildStandupPrompt_(recent) {
+  return "Generate a weekly standup update in markdown for these bets that moved in the last 7 days.\n\n" +
+    "Format with these sections (omit any that are empty):\n" +
+    "## Shipped\n## In flight\n## Blocked / Waiting\n## Next up\n\n" +
+    "Keep each item to one line. Use the Status field to bucket. Use the Investigator field to attribute. Don't invent details — only use what's in the data.\n\n" +
+    "Recent activity:\n" + JSON.stringify(recent, null, 2);
+}
+
+function buildSuggestDropdownsPrompt_(rows) {
+  return "Review this portfolio of bets. For each row where Notes / context contradicts the current Tier / Priority / Status dropdown values, suggest a change.\n\n" +
+    "Output format — markdown checklist, one bullet per suggestion:\n" +
+    "- **<Innovation name>** — <column>: `<current value>` → `<suggested value>`. <one-line reason>\n\n" +
+    "Only propose changes when there's STRONG signal in the notes — don't propose routine adjustments. Limit to 5 suggestions max.\n\n" +
+    "Valid tier values: " + TIER_OPTIONS.join(" | ") + "\n" +
+    "Valid priority values: " + PRIORITY_OPTIONS.join(" | ") + "\n" +
+    "Valid status values: " + STATUS_OPTIONS.join(" | ") + "\n\n" +
+    "Portfolio:\n" + JSON.stringify(rows, null, 2);
+}
+
+function buildFlagRisksPrompt_(rows) {
+  var today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd");
+  return "Audit this portfolio for risk signals. Surface bets where:\n" +
+    "- Last Updated is more than 14 days ago and not Done/Paused/Idea (stale work)\n" +
+    "- Notes mention blockers, delays, performance issues, or kill criteria conditions\n" +
+    "- A row should probably move to Paused / Fixing / Waiting based on signal\n\n" +
+    "Today's date: " + today + "\n\n" +
+    "Output as markdown checklist:\n" +
+    "- **<Innovation name>** — <risk signal>. Suggested action: <action>\n\n" +
+    "Limit to 5. Be specific.\n\n" +
+    "Portfolio:\n" + JSON.stringify(rows, null, 2);
+}
+
+function buildDraftHypothesesPrompt_(enriched) {
+  return "For each Idea row missing a Hypothesis, draft a one-line hypothesis grounded in the Innovation name + Notes.\n\n" +
+    "Format: \"If [we do X], [Y will happen] because [Z].\"\n\n" +
+    "Output as markdown:\n" +
+    "- **<Innovation name>** — <drafted hypothesis>\n\n" +
+    "Don't invent details — only use what's in the data. Skip rows where notes give no signal.\n\n" +
+    "Idea rows missing hypothesis:\n" + JSON.stringify(enriched, null, 2);
+}
+
+function buildProposePebblesPrompt_(rows) {
+  return "Based on this portfolio of bets, propose 3-5 NEW Pebble-tier experiments that would unblock or de-risk current work.\n\n" +
+    "A good Pebble:\n" +
     "- Small (1-3 hours of work)\n" +
     "- Generates evidence for a bigger bet in the portfolio\n" +
     "- Specific and actionable (e.g. 'Spike Claude API for X' not 'Try AI')\n\n" +
-    "Return JSON ONLY in this shape:\n" +
-    '{ "proposals": [ { "id": "<unique>", "kind": "create", "row": "<bet name>", "data": { "innovation": "<bet name>", "investigator": "<best owner>", "tier": "🔹 Pebble", "priority": "🟡 Medium", "status": "Idea" }, "reason": "<which bigger bet this unblocks>" } ] }\n\n' +
-    "Use existing Investigators when picking owners. Limit to 5 proposals.\n\n" +
+    "Output as markdown:\n" +
+    "- **<bet name>** — owner: <name>. <which bigger bet this unblocks>\n\n" +
+    "Use existing Investigator names as owners.\n\n" +
     "Portfolio:\n" + JSON.stringify(rows, null, 2);
+}
 
-  runDiffMode_("proposePebbles", "Propose new Pebble experiments", prompt);
+function showAiPrompt_(title, prompt, instructions) {
+  var html = HtmlService.createHtmlOutput(aiPromptModalHtml_(title, prompt, instructions))
+    .setWidth(640).setHeight(620);
+  SpreadsheetApp.getUi().showModalDialog(html, "AI Prompt Ready");
+}
+
+function aiPromptModalHtml_(title, prompt, instructions) {
+  var safeTitle = title.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  var safeInstr = (instructions || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  var safePrompt = JSON.stringify(prompt);
+  return '' +
+    '<!DOCTYPE html><html><head><base target="_top">' +
+    '<style>' +
+    '  body{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#0a0a0a;background:#fafafa;margin:0;padding:20px;}' +
+    '  .eyebrow{font-size:9px;font-weight:700;letter-spacing:0.18em;text-transform:uppercase;color:#999;margin-bottom:4px;}' +
+    '  h1{font-size:18px;margin:0 0 6px;line-height:1.3;}' +
+    '  .instr{font-size:11px;color:#555;margin-bottom:14px;line-height:1.5;}' +
+    '  .prompt{background:#fff;border:1px solid rgba(0,0,0,0.1);padding:14px 16px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;line-height:1.55;color:#0a0a0a;white-space:pre-wrap;word-wrap:break-word;max-height:380px;overflow-y:auto;}' +
+    '  .actions{display:flex;gap:8px;margin-top:14px;align-items:center;}' +
+    '  button{font-family:inherit;font-size:11px;font-weight:700;letter-spacing:0.16em;text-transform:uppercase;padding:11px 22px;cursor:pointer;border:1px solid #0a0a0a;background:#0a0a0a;color:#F7BE68;}' +
+    '  button.secondary{background:#fff;color:#0a0a0a;}' +
+    '  .meta{font-size:10px;color:#999;margin-left:auto;}' +
+    '  .copied{color:#2E8B3D;font-weight:700;}' +
+    '</style></head><body>' +
+    '<div class="eyebrow">AI Prompt · Ready to paste</div>' +
+    '<h1>' + safeTitle + '</h1>' +
+    '<div class="instr">' + safeInstr + '</div>' +
+    '<div class="prompt" id="prompt"></div>' +
+    '<div class="actions"><button id="copy">Copy prompt</button><button class="secondary" id="close">Close</button><span class="meta" id="len"></span></div>' +
+    '<script>' +
+    '  var P = ' + safePrompt + ';' +
+    '  document.getElementById("prompt").textContent = P;' +
+    '  document.getElementById("len").textContent = P.length + " chars";' +
+    '  document.getElementById("copy").addEventListener("click", function(){' +
+    '    var ta = document.createElement("textarea"); ta.value = P; document.body.appendChild(ta);' +
+    '    ta.select(); document.execCommand("copy"); document.body.removeChild(ta);' +
+    '    this.textContent = "Copied — go paste it"; this.classList.add("copied");' +
+    '  });' +
+    '  document.getElementById("close").addEventListener("click", function(){ google.script.host.close(); });' +
+    '</script></body></html>';
 }
 
 // ============================================================
