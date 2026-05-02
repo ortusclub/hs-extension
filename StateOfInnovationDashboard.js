@@ -1027,7 +1027,7 @@ function openSettings() {
 // ============================================================
 
 var GEMINI_API_KEY = "AIzaSyD9eEQ4_0ADLrOe0zaAaAhi2zX8Bnm8pFI";
-var GEMINI_MODEL = "gemini-2.0-flash-exp";
+var GEMINI_MODEL = "gemini-2.0-flash";
 var GEMINI_DAILY_TOKEN_BUDGET = 200000;
 
 var AI_LOG_SHEET_NAME = "_AILog";
