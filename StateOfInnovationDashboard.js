@@ -357,7 +357,11 @@ function onEdit(e) {
   if (!innovation || isDividerValue_(innovation)) return;
 
   if (col === COL.innovation + 1 && e.oldValue) {
-    renameBetDetailKey_(e.oldValue, e.value);
+    if (!e.value || clean_(e.value) === "") {
+      deleteBetDetail_(e.oldValue);
+    } else {
+      renameBetDetailKey_(e.oldValue, e.value);
+    }
   }
 
   if (col === COL.status + 1 && e.oldValue !== undefined && e.value !== undefined) {
@@ -1116,6 +1120,22 @@ function renameBetDetailKey_(oldKey, newKey) {
     if (clean_(rows[i][BD_COL.key]) === oldClean) {
       sheet.getRange(i + 2, BD_COL.key + 1).setValue(newClean);
       return;
+    }
+  }
+}
+
+function deleteBetDetail_(innovationKey) {
+  var key = clean_(innovationKey);
+  if (!key) return;
+
+  var sheet = ensureBetDetailSheet_();
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+
+  var rows = sheet.getRange(2, 1, lastRow - 1, BET_DETAIL_HEADERS.length).getValues();
+  for (var i = rows.length - 1; i >= 0; i--) {
+    if (clean_(rows[i][BD_COL.key]) === key) {
+      sheet.deleteRow(i + 2);
     }
   }
 }
