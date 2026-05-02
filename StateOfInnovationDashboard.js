@@ -169,7 +169,6 @@ function onOpen() {
     .createMenu("State of Innovation")
     .addItem("Setup dashboard", "setupDashboard")
     .addItem("Group by owner", "groupByOwner")
-    .addItem("Move completed to Done section", "consolidateDoneSection")
     .addSeparator()
     .addItem("Open Bet Detail for selected row", "openBetDetailSidebar")
     .addSeparator()
@@ -1386,93 +1385,6 @@ function showTierLegend() {
 }
 
 // ============================================================
-// CONSOLIDATE DONE — manual archive (menu-triggered, not automatic)
-// ============================================================
-
-function consolidateDoneSection() {
-  var ui = null;
-  try { ui = SpreadsheetApp.getUi(); } catch (e) { ui = null; }
-
-  if (ui) {
-    var resp = ui.alert(
-      "Move all Done rows to the Done section?",
-      "This will sort active rows by owner+priority, then place all Done rows in a single Done section at the bottom (most recent first). Done rows stay archived until you change their status.",
-      ui.ButtonSet.OK_CANCEL
-    );
-    if (resp !== ui.Button.OK) return;
-  }
-
-  var moved = countDoneRows_();
-  consolidateDoneSection_();
-  toast_(moved + " Done row(s) consolidated.");
-}
-
-function countDoneRows_() {
-  var sheet = SpreadsheetApp.getActiveSheet();
-  var lastRow = sheet.getLastRow();
-
-  if (lastRow < CONFIG.dataStartRow) return 0;
-
-  var values = sheet
-    .getRange(CONFIG.dataStartRow, COL.status + 1, lastRow - CONFIG.dataStartRow + 1)
-    .getValues();
-
-  var count = 0;
-  for (var i = 0; i < values.length; i++) {
-    if (clean_(values[i][0]) === STATUS.DONE) count++;
-  }
-  return count;
-}
-
-function consolidateDoneSection_() {
-  var sheet = SpreadsheetApp.getActiveSheet();
-  var lastRow = sheet.getLastRow();
-
-  if (lastRow < CONFIG.dataStartRow) return;
-
-  var rowCount = lastRow - CONFIG.dataStartRow + 1;
-  var dataRange = sheet.getRange(CONFIG.dataStartRow, 1, rowCount, CONFIG.numCols);
-
-  var values = dataRange.getValues();
-  var richText = sheet
-    .getRange(CONFIG.dataStartRow, COL.notes + 1, rowCount, 2)
-    .getRichTextValues();
-
-  var allRows = collectDataRows_(values, richText);
-  var activeRows = [];
-  var doneRows = [];
-
-  allRows.forEach(function(row) {
-    if (row.status === STATUS.DONE) doneRows.push(row);
-    else activeRows.push(row);
-  });
-
-  activeRows.sort(compareRows_);
-  doneRows.sort(function(a, b) {
-    var dA = clean_(a.values[COL.updated]);
-    var dB = clean_(b.values[COL.updated]);
-    return dB.localeCompare(dA);
-  });
-
-  var output = buildGroupedOutput_(activeRows);
-
-  if (doneRows.length > 0) {
-    if (activeRows.length > 0) pushBlankRow_(output);
-    pushDividerRow_(output, CONFIG.oldDoneLabel);
-    doneRows.forEach(function(row) {
-      pushDataRow_(output, row.values, row.richText);
-    });
-  }
-
-  padOutput_(output, Math.max(rowCount, output.values.length));
-  writeGroupedOutput_(sheet, output);
-  applyInnovationCellRichText_(sheet, output, new Date());
-  applyStatusBadges_(sheet, output);
-  applyColumnStyling_(sheet, output.values.length);
-  applyDropdowns_(sheet);
-}
-
-// ============================================================
 // MIGRATIONS — one-shot upgrades for existing sheets
 // ============================================================
 
@@ -1625,41 +1537,6 @@ function test_doneRowsStayWithOwner() {
              positions["Bet A"] < positions["Bet C"];
     Logger.log("test_doneRowsStayWithOwner: " + (passed ? "PASS" : "FAIL"));
     Logger.log("  positions = " + JSON.stringify(positions));
-  } finally {
-    ss.setActiveSheet(prevSheet);
-    ss.deleteSheet(testSheet);
-  }
-  return passed;
-}
-
-function test_consolidateDoneMovesToSection() {
-  var ss = SpreadsheetApp.getActive();
-  var prevSheet = ss.getActiveSheet();
-  var testSheet = ss.insertSheet("__test_consolidate__");
-  var passed = false;
-  try {
-    testSheet.getRange(1, 1, 1, CONFIG.numCols).setValues([HEADERS]);
-    testSheet.getRange(2, 1, 3, CONFIG.numCols).setValues([
-      ["Bet A", "Alice", "🪨 Stone", PRIORITY.HIGH,     STATUS.WORKING, "", "", "2026-05-01 10:00"],
-      ["Bet B", "Alice", "🪨 Stone", PRIORITY.CRITICAL, STATUS.DONE,    "", "", "2026-05-01 10:00"],
-      ["Bet C", "Alice", "🪨 Stone", PRIORITY.MEDIUM,   STATUS.WORKING, "", "", "2026-05-01 10:00"]
-    ]);
-    ss.setActiveSheet(testSheet);
-    consolidateDoneSection_();
-    var lastRow = testSheet.getLastRow();
-    var rowsAfter = testSheet.getRange(2, 1, lastRow - 1, COL.innovation + 1).getValues();
-    var doneDividerIdx = -1, betAidx = -1, betBidx = -1, betCidx = -1;
-    for (var i = 0; i < rowsAfter.length; i++) {
-      var name = rowsAfter[i][COL.innovation];
-      if (name === CONFIG.oldDoneLabel) doneDividerIdx = i;
-      if (name === "Bet A") betAidx = i;
-      if (name === "Bet B") betBidx = i;
-      if (name === "Bet C") betCidx = i;
-    }
-    passed = doneDividerIdx > -1 && betAidx > -1 && betBidx > -1 && betCidx > -1 &&
-             betAidx < doneDividerIdx && betCidx < doneDividerIdx && betBidx > doneDividerIdx;
-    Logger.log("test_consolidateDoneMovesToSection: " + (passed ? "PASS" : "FAIL"));
-    Logger.log("  doneDivider@" + doneDividerIdx + " BetA@" + betAidx + " BetB@" + betBidx + " BetC@" + betCidx);
   } finally {
     ss.setActiveSheet(prevSheet);
     ss.deleteSheet(testSheet);
