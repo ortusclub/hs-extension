@@ -361,6 +361,9 @@ function onEdit(e) {
   }
 
   if (col === COL.status + 1 && e.oldValue !== undefined && e.value !== undefined) {
+    if (clean_(e.oldValue) === STATUS.IDEA && clean_(e.value) !== STATUS.IDEA) {
+      warnHypothesisMissing_(innovation);
+    }
     if (shouldPromptDecisionLog_(e.oldValue, e.value, null, null)) {
       var transition = clean_(e.oldValue) + " → " + clean_(e.value);
       promptForDecisionLog_(innovation, transition);
@@ -1266,6 +1269,13 @@ function submitDecisionLogEntry(innovationKey, what) {
     who: who
   });
   return true;
+}
+
+function warnHypothesisMissing_(innovationKey) {
+  var detail = getBetDetail_(innovationKey);
+  if (clean_(detail.hypothesis) !== "") return;
+  var msg = "Heads up: \"" + innovationKey + "\" doesn't have a hypothesis yet. Open Bet Detail to add one.";
+  toast_(msg);
 }
 
 function decisionLogModalHtml_(innovationKey, transitionLabel) {
