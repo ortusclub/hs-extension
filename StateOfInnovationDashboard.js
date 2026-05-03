@@ -395,11 +395,6 @@ function onEdit(e) {
   if (isUserDataColumn_(col)) {
     updateTimestamp_(sheet, row);
   }
-
-  if (isSortTriggerColumn_(col) && rowHasRequiredSortFields_(sheet, row)) {
-    SpreadsheetApp.flush();
-    groupByOwnerCore_();
-  }
 }
 
 function updateTimestamp_(sheet, row) {
@@ -410,20 +405,6 @@ function isUserDataColumn_(oneBasedCol) {
   return oneBasedCol >= 1 &&
     oneBasedCol <= CONFIG.numCols &&
     oneBasedCol !== COL.updated + 1;
-}
-
-function isSortTriggerColumn_(oneBasedCol) {
-  return oneBasedCol === COL.tier + 1 ||
-    oneBasedCol === COL.priority + 1 ||
-    oneBasedCol === COL.status + 1;
-}
-
-function rowHasRequiredSortFields_(sheet, row) {
-  var tier = clean_(sheet.getRange(row, COL.tier + 1).getValue());
-  var priority = clean_(sheet.getRange(row, COL.priority + 1).getValue());
-  var status = clean_(sheet.getRange(row, COL.status + 1).getValue());
-
-  return tier && priority && status;
 }
 
 // ============================================================
