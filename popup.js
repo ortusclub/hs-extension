@@ -201,6 +201,12 @@ function render(payload) {
         "Token may have been rotated.",
         "401 · Antonio needs to ship an updated build with a fresh token.");
 
+    case "error_unconfigured":
+      setBadge("error", "Install error");
+      return setError("This GitHub build is not configured",
+        "Install the packaged version from Google Sheets.",
+        "The public GitHub ZIP does not include the private HubSpot token.");
+
     case "error_scope":
       setBadge("error", "Scope error");
       return setError("HubSpot scope missing",

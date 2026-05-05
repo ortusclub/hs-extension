@@ -12,6 +12,10 @@ const HUBSPOT_PORTAL_ID = "2748825";
 const client = self.OrtusHubSpot.createClient({ token: HUBSPOT_TOKEN });
 
 let propertyCheckPromise = null; // memoised for service worker lifetime
+function isPackagedBuild() {
+  return HUBSPOT_TOKEN && HUBSPOT_TOKEN !== "__HUBSPOT_TOKEN__";
+}
+
 function ensurePropertyCheck() {
   if (!propertyCheckPromise) {
     propertyCheckPromise = client.checkProperty("linkedin_membership_id");
@@ -43,6 +47,8 @@ function hubspotContactUrl(contactId) {
 }
 
 async function getProfileState() {
+  if (!isPackagedBuild()) return { state: "error_unconfigured" };
+
   const propCheck = await ensurePropertyCheck();
   if (propCheck.error)  return { state: mapClientErrorState(propCheck) };
   if (!propCheck.exists) return { state: "error_property" };
@@ -88,6 +94,8 @@ function mapClientErrorState(r) {
 }
 
 async function pushToHubSpot(scrape) {
+  if (!isPackagedBuild()) return { state: "error_unconfigured" };
+
   const r = await client.createContact(scrape);
   if (r.error) return { state: mapClientErrorState(r) };
   return {
@@ -98,6 +106,8 @@ async function pushToHubSpot(scrape) {
 }
 
 async function updateContact(contactId, scrape) {
+  if (!isPackagedBuild()) return { state: "error_unconfigured" };
+
   const r = await client.updateContact(contactId, scrape);
   if (r.error) return { state: mapClientErrorState(r) };
   return {
@@ -117,6 +127,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       } else if (msg.type === "UPDATE_CONTACT") {
         sendResponse(await updateContact(msg.contactId, msg.scrape));
       } else if (msg.type === "TEST_CONNECTION") {
+        if (!isPackagedBuild()) {
+          sendResponse({ propertyExists: false, error: "unconfigured" });
+          return;
+        }
         const propCheck = await client.checkProperty("linkedin_membership_id");
         sendResponse({ propertyExists: !!propCheck.exists, error: propCheck.error || null });
       } else if (msg.type === "RESET_CACHE") {
