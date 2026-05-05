@@ -47,12 +47,51 @@ async function forceLazyLoad() {
   await new Promise(r => setTimeout(r, 80));
 }
 
+// Track the last scraped profile slug so we can detect SPA navigation between
+// profiles. LinkedIn's SPA leaves the previous profile's hydration JSON in the
+// DOM, so without this the scraper can return the previously-viewed profile's
+// memberId for the new URL. Only waits when the slug actually changed — first
+// scrape on any tab uses the existing forceLazyLoad path with no extra wait.
+let lastScrapedSlug = "";
+
+function currentProfileSlug() {
+  const m = /\/in\/([^/?#]+)/i.exec(location.pathname);
+  return m ? m[1] : "";
+}
+
+function canonicalProfileSlug() {
+  const link = document.querySelector('link[rel="canonical"]');
+  if (!link) return "";
+  const m = /\/in\/([^/?#]+)/i.exec(link.getAttribute("href") || "");
+  return m ? m[1] : "";
+}
+
+async function waitForSlugInHydration(slug) {
+  const slugs = [slug, canonicalProfileSlug()].filter(Boolean);
+  const patterns = slugs.map(s => {
+    const esc = s.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&");
+    return new RegExp(`"publicIdentifier"\\s*:\\s*"${esc}"`, "i");
+  });
+  await waitFor(() => {
+    const html = document.documentElement.innerHTML;
+    return patterns.some(re => re.test(html));
+  }, { maxMs: 5000, intervalMs: 100 });
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg && msg.type === "SCRAPE_PROFILE") {
     (async () => {
       try {
-        if (/\/in\//.test(location.pathname) || /\/sales\/lead\//.test(location.pathname)) {
+        const onProfile = /\/in\//.test(location.pathname);
+        if (onProfile || /\/sales\/lead\//.test(location.pathname)) {
           await forceLazyLoad();
+        }
+        if (onProfile) {
+          const slug = currentProfileSlug();
+          if (lastScrapedSlug && slug && lastScrapedSlug !== slug) {
+            await waitForSlugInHydration(slug);
+          }
+          if (slug) lastScrapedSlug = slug;
         }
         const result = window.OrtusScraper.scrapeProfile(document, location.href);
         sendResponse({ ok: true, result });
