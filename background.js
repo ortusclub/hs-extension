@@ -1,10 +1,10 @@
-// background.js — service worker. Hardcoded HubSpot token. Orchestrates lookups.
+// background.js — service worker. HubSpot token is injected only when packaging.
 
 importScripts("hubspotClient.js");
 
-// === HARDCODED CREDENTIALS ===
-// Rotate by editing these two values, bumping manifest.json version, rebuilding,
-// and redistributing the .zip. Never share unmodified tokens externally.
+// === PACKAGING CONFIG ===
+// Do not commit a real HubSpot token. The Google Sheets download script replaces
+// __HUBSPOT_TOKEN__ with the token stored in Apps Script properties.
 const HUBSPOT_TOKEN = "__HUBSPOT_TOKEN__";
 const HUBSPOT_PORTAL_ID = "2748825";
 // ==============================

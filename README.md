@@ -23,21 +23,23 @@ zip -r "HS-Sync-v0.1.0.zip" \
   popup.html popup.js icons/
 ```
 
-Distribute the zip only to trusted operators. The HubSpot token is hardcoded inside `background.js`.
+Distribute the zip only to trusted operators. Do not commit a real HubSpot token
+to this repository. The distributed zip should be produced by the Google Sheets
+download script, which injects the token from Apps Script properties.
 
 ## Token rotation
 
-The HubSpot Private App token lives at the top of `background.js`:
+The committed `background.js` contains a placeholder:
 
 ```js
-const HUBSPOT_TOKEN = "pat-na1-...";
+const HUBSPOT_TOKEN = "__HUBSPOT_TOKEN__";
 const HUBSPOT_PORTAL_ID = "...";
 ```
 
 To rotate:
 
 1. In HubSpot, rotate the Private App token. Confirm scopes: `crm.objects.contacts.read`, `crm.objects.contacts.write`, `crm.schemas.contacts.read`.
-2. Paste the new token into `background.js`.
+2. Update the `HUBSPOT_TOKEN` Apps Script property used by the Google Sheets download script.
 3. Bump `version` in `manifest.json`.
 4. Rebuild the zip with the command above.
 5. Re-distribute to operators (each operator reloads via `chrome://extensions`).
